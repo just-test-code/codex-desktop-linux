@@ -11,6 +11,8 @@ on:
       - scripts/patch-linux-window-ui.test.js
       - scripts/patches/**
       - scripts/ci/validate-patch-report.js
+      - scripts/build-deb.sh
+      - packaging/linux/**
       - .github/workflows/upstream-build-app.yml
   push:
     branches:
@@ -22,6 +24,8 @@ on:
       - scripts/patch-linux-window-ui.test.js
       - scripts/patches/**
       - scripts/ci/validate-patch-report.js
+      - scripts/build-deb.sh
+      - packaging/linux/**
       - .github/workflows/upstream-build-app.yml
   workflow_dispatch:
 
@@ -38,10 +42,14 @@ jobs:
   build-app-upstream-dmg:
     name: Build App Against Upstream DMG
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -140,6 +148,114 @@ jobs:
       - name: Validate required upstream patches
         run: node scripts/ci/validate-patch-report.js patch-report.json --profile upstream-build
 
+      - name: Resolve release version
+        id: release-version
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+
+          upstream_version=""
+          if [ -f codex-app/.codex-linux/build-info.json ]; then
+            upstream_version="$(node -p "try{const value=require('./codex-app/.codex-linux/build-info.json')?.upstreamDmg?.appVersion; value&&String(value).trim()||''}catch{''}")"
+          fi
+
+          if [ -n "$upstream_version" ]; then
+            base_version="$upstream_version"
+            version_source="upstream"
+          else
+            base_version="$(date -u +%Y.%m.%d)"
+            version_source="date"
+          fi
+
+          package_version="${base_version}+linux${GITHUB_RUN_NUMBER}"
+          tag_name="v${base_version}"
+          skip_release=false
+          if git rev-parse "refs/tags/${tag_name}" >/dev/null 2>&1; then
+            skip_release=true
+            echo "Release tag ${tag_name} already exists; skipping GitHub release publish."
+          fi
+
+          {
+            echo "base_version=$base_version"
+            echo "package_version=$package_version"
+            echo "tag_name=$tag_name"
+            echo "version_source=$version_source"
+            echo "skip_release=$skip_release"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install Debian packaging tooling
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev
+
+      - name: Build Debian package from upstream app
+        if: github.event_name != 'pull_request'
+        run: make deb PACKAGE_VERSION="${{ steps.release-version.outputs.package_version }}"
+
+      - name: Inspect Debian package
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          deb_file="$(find dist -maxdepth 1 -name 'codex-desktop_*.deb' -print -quit)"
+          test -n "$deb_file"
+          dpkg-deb -I "$deb_file"
+          dpkg-deb -c "$deb_file" | tee /tmp/deb-contents.txt >/dev/null
+          grep -q './usr/bin/codex-update-manager' /tmp/deb-contents.txt
+          grep -q './usr/lib/systemd/user/codex-update-manager.service' /tmp/deb-contents.txt
+          grep -q './opt/codex-desktop/update-builder/install.sh' /tmp/deb-contents.txt
+          grep -q './opt/codex-desktop/.codex-linux/codex-packaged-runtime.sh' /tmp/deb-contents.txt
+          printf '%s\n' "$(basename "$deb_file")" > /tmp/deb-package-name.txt
+          printf '%s\n' "$deb_file" > /tmp/deb-package-path.txt
+
+      - name: Publish GitHub release
+        if: >-
+          github.event_name != 'pull_request' &&
+          github.ref == 'refs/heads/main' &&
+          steps.release-version.outputs.skip_release != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          deb_file="$(cat /tmp/deb-package-path.txt)"
+          test -f "$deb_file"
+
+          wrapper_commit="$(git rev-parse HEAD)"
+          cat > /tmp/release-notes.md <<EOF
+          ## Codex Desktop Linux ${{ steps.release-version.outputs.base_version }}
+
+          Built from upstream \`Codex.dmg\` on \`${{ github.ref_name }}\` at commit [\`${wrapper_commit:0:12}\`](${{ github.server_url }}/${{ github.repository }}/commit/${wrapper_commit}).
+
+          - Release version source: \`${{ steps.release-version.outputs.version_source }}\`
+          - Upstream DMG SHA-256: \`${{ steps.local-dmg.outputs.sha256 }}\`
+          - Debian package version: \`${{ steps.release-version.outputs.package_version }}\`
+          - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ### Install
+
+          \`\`\`bash
+          sudo dpkg -i $(basename "$deb_file")
+          sudo apt-get install -f
+          \`\`\`
+          EOF
+
+          gh release create "${{ steps.release-version.outputs.tag_name }}" \
+            --target "$GITHUB_SHA" \
+            --title "Codex Desktop Linux ${{ steps.release-version.outputs.base_version }}" \
+            --notes-file /tmp/release-notes.md \
+            "$deb_file" \
+            upstream-dmg-metadata.json \
+            codex-app/.codex-linux/build-info.json
+
+      - name: Upload Debian package artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-desktop-deb-upstream
+          path: dist/codex-desktop_*.deb
+          if-no-files-found: error
+
       - name: Upload upstream DMG metadata artifact
         # The build step now aborts on critical patch failures; keep uploading
         # the patch report so the failure is diagnosable from the artifact.
@@ -167,4 +283,17 @@ jobs:
             echo "- Cache Hit: \`${{ steps.dmg-cache.outputs.cache-hit || 'false' }}\`"
             echo "- Build command: \`make build-app DMG=/tmp/codex-upstream-ci/Codex.dmg\`"
             echo "- Patch report: \`patch-report.json\`"
+            if [ "${{ github.event_name }}" != "pull_request" ] && [ -f /tmp/deb-package-name.txt ]; then
+              echo "- Debian package: \`$(cat /tmp/deb-package-name.txt)\`"
+              echo "- Release version: \`${{ steps.release-version.outputs.base_version }}\` (\`${{ steps.release-version.outputs.version_source }}\`)"
+              echo "- Package version: \`${{ steps.release-version.outputs.package_version }}\`"
+              echo "- Artifact: \`codex-desktop-deb-upstream\`"
+              if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+                if [ "${{ steps.release-version.outputs.skip_release }}" = "true" ]; then
+                  echo "- GitHub release: skipped (tag \`${{ steps.release-version.outputs.tag_name }}\` already exists)"
+                else
+                  echo "- GitHub release: \`${{ steps.release-version.outputs.tag_name }}\`"
+                fi
+              fi
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

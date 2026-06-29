@@ -81,10 +81,10 @@
 
         codexDmg = pkgs.fetchurl {
           url = "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg";
-          hash = "sha256-4NB5Cb0EfYl9tUTjZhA9TxTAbB4DjoRDqpfckEBfys8=";
+          hash = "sha256-gPAmEhtiPTtfMXI5qiAmBdkMD+DkWewnyFm6I2kjzbs=";
         };
 
-        codexVersion = "26.616.51431";
+        codexVersion = "26.623.42026";
         electronVersion = "42.1.0";
         electronPlatform =
           {
@@ -137,9 +137,6 @@
 
           cargoLock = {
             lockFile = ./Cargo.lock;
-            outputHashes = {
-              "cosmic-protocols-0.2.0" = "sha256-ymn+BUTTzyHquPn4hvuoA3y1owFj8LVrmsPu2cdkFQ8=";
-            };
           };
 
           buildAndTestSubdir = "computer-use-linux";

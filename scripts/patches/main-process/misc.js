@@ -56,6 +56,84 @@ function applyLinuxFileManagerPatch(currentSource) {
   return patchedSource;
 }
 
+function applyLinuxWorkerFileManagerPatch(currentSource) {
+  const block = findCallBlock(currentSource, "id:`fileManager`");
+  if (block == null) {
+    console.warn("Failed to apply Linux Worker File Manager Patch");
+    return currentSource;
+  }
+
+  if (block.text.includes("linux:{")) {
+    return currentSource;
+  }
+
+  const fsVar = requireName(currentSource, "node:fs");
+  const pathVar = requireName(currentSource, "node:path");
+  if (fsVar == null || pathVar == null) {
+    console.warn("Failed to apply Linux Worker File Manager Patch");
+    return currentSource;
+  }
+
+  const insertionPoint = block.text.lastIndexOf("}});");
+  if (insertionPoint === -1) {
+    console.warn("Failed to apply Linux Worker File Manager Patch");
+    return currentSource;
+  }
+
+  const linuxFileManager =
+    `,linux:{label:\`File Manager\`,icon:\`apps/file-explorer.png\`,detect:()=>\`linux-file-manager\`,args:e=>[e],open:async({path:e})=>{let t=e;for(;;){try{if(${fsVar}.existsSync(t))break}catch{}let e=${pathVar}.dirname(t);if(e===t)break;t=e}try{${fsVar}.existsSync(t)&&${fsVar}.statSync(t).isFile()&&(t=${pathVar}.dirname(t))}catch{}let i=await(await import(\`electron\`)).shell.openPath(t);if(i)throw Error(i)}}`;
+
+  const patchedBlock =
+    block.text.slice(0, insertionPoint + 1) +
+    linuxFileManager +
+    block.text.slice(insertionPoint + 1);
+  const patchedSource =
+    currentSource.slice(0, block.start) + patchedBlock + currentSource.slice(block.end);
+
+  const patchedBlockCheck = patchedSource.slice(block.start, block.start + patchedBlock.length);
+  if (
+    !patchedBlockCheck.includes("linux:{label:`File Manager`") ||
+    !patchedBlockCheck.includes("detect:()=>`linux-file-manager`") ||
+    !patchedBlockCheck.includes("import(`electron`)).shell.openPath(t)")
+  ) {
+    console.warn("Failed to apply Linux Worker File Manager Patch");
+    return currentSource;
+  }
+
+  return patchedSource;
+}
+
+function patchLinuxWorkerFileManagerTarget(extractedDir) {
+  const workerPath = path.join(extractedDir, ".vite", "build", "worker.js");
+  if (!fs.existsSync(workerPath)) {
+    console.warn(
+      `WARN: Could not find worker bundle at ${workerPath} — skipping Linux Worker File Manager Patch`,
+    );
+    return { matched: 0, changed: 0, reason: "worker bundle not found" };
+  }
+
+  const source = fs.readFileSync(workerPath, "utf8");
+  const patchedSource = applyLinuxWorkerFileManagerPatch(source);
+  if (patchedSource === source) {
+    const hasTarget = source.includes("id:`fileManager`");
+    const hasLinuxTarget = source.includes("linux:{label:`File Manager`");
+    const hasPatchableBlock = findCallBlock(source, "id:`fileManager`") != null;
+    return {
+      matched: hasPatchableBlock ? 1 : 0,
+      changed: 0,
+      reason: !hasTarget
+        ? "fileManager target not found"
+        : hasLinuxTarget
+          ? null
+          : hasPatchableBlock
+            ? "fileManager target found but Linux worker patch was not applied"
+            : "fileManager target found but patchable block not found",
+    };
+  }
+  fs.writeFileSync(workerPath, patchedSource, "utf8");
+  return { matched: 1, changed: 1 };
+}
+
 function applyLinuxGitOriginsSourceFallbackPatch(currentSource) {
   const fallbackSource = "linux_git_origins_missing_source_fallback";
   if (currentSource.includes(`source:\`${fallbackSource}\`,requestKind:`)) {
@@ -98,6 +176,21 @@ function applyLinuxOwlFeatureBindingFallbackPatch(currentSource) {
     /function ([A-Za-z_$][\w$]*)\(\)\{let ([A-Za-z_$][\w$]*)=process\._linkedBinding;if\(typeof \2!=`function`\)throw Error\(`Owl feature binding is unavailable`\);return ([A-Za-z_$][\w$]*)\.parse\(\2\.call\(process,`electron_common_owl_features`\)\)\}/u;
   const match = currentSource.match(loaderRegex);
   if (match == null) {
+    // 26.623+ rewrote the loader to natively return null when the binding is
+    // unavailable (`process._linkedBinding` missing) and to swallow the
+    // "No such binding was linked" error — exactly the Linux fallback this
+    // patch injected. When that native-safe shape is present there is nothing
+    // to patch, so stand down silently instead of failing the required patch.
+    const upstreamReturnsNullOnMissingBinding =
+      /let ([A-Za-z_$][\w$]*)=process\._linkedBinding;if\(typeof \1!=`function`\)return null;/u.test(
+        currentSource,
+      );
+    if (
+      upstreamReturnsNullOnMissingBinding &&
+      currentSource.includes("No such binding was linked:")
+    ) {
+      return currentSource;
+    }
     console.warn(
       "WARN: Could not find Owl feature binding loader - skipping Linux Owl feature fallback patch",
     );
@@ -231,8 +324,19 @@ function applyLinuxXdgDocumentsDirPatch(currentSource) {
 
 function applyLinuxLocalAppServerFeatureEnablementHandlerPatch(currentSource) {
   const method = "set-local-app-server-feature-enablement";
+  const featureKeys = [
+    "remote_control",
+    "remote_plugin",
+    "memories",
+    "mentions_v2",
+    "tool_search",
+    "tool_suggest",
+    "tool_call_mcp_elicitation",
+    "plugins",
+    "apps",
+  ];
   const handler =
-    "async e=>{let t=e?.params??e??{},n={},r=(e,t)=>{typeof t===`boolean`&&(n[e]=t)};if(t.enablement&&typeof t.enablement===`object`)for(let[e,n]of Object.entries(t.enablement))r(e,n);let i=t.featureName??t.feature_name??t.name??t.feature??null,a=t.enabled;i!=null&&r(i,a);for(let e of[`remote_control`,`remote_plugin`,`memories`,`tool_suggest`,`tool_call_mcp_elicitation`,`plugins`,`apps`])r(e,t[e]);let o=this.sharedObjectRepository?.get?.(`local_app_server_feature_enablement`)??{};return this.sharedObjectRepository?.set?.(`local_app_server_feature_enablement`,{...o,...n}),Object.prototype.hasOwnProperty.call(n,`remote_control`)&&this.sharedObjectRepository?.set?.(`local_remote_control_enabled`,n.remote_control),{enabled:n}}";
+    `async e=>{let t=e?.params??e??{},n={},r=(e,t)=>{typeof t===\`boolean\`&&(n[e]=t)};if(t.enablement&&typeof t.enablement===\`object\`)for(let[e,n]of Object.entries(t.enablement))r(e,n);let i=t.featureName??t.feature_name??t.name??t.feature??null,a=t.enabled;i!=null&&r(i,a);for(let e of[${featureKeys.map((key) => `\`${key}\``).join(",")}])r(e,t[e]);let o=this.sharedObjectRepository?.get?.(\`local_app_server_feature_enablement\`)??{};return this.sharedObjectRepository?.set?.(\`local_app_server_feature_enablement\`,{...o,...n}),Object.prototype.hasOwnProperty.call(n,\`remote_control\`)&&this.sharedObjectRepository?.set?.(\`local_remote_control_enabled\`,n.remote_control),{enabled:n}}`;
   let patchedSource = currentSource;
 
   if (!patchedSource.includes(`methods:[\`${method}\`]`)) {
@@ -286,7 +390,9 @@ module.exports = {
   applyLinuxGitOriginsSourceFallbackPatch,
   applyLinuxLocalAppServerFeatureEnablementHandlerPatch,
   applyLinuxOwlFeatureBindingFallbackPatch,
+  applyLinuxWorkerFileManagerPatch,
   patchLinuxOwlFeatureBindingFallbackAssets,
+  patchLinuxWorkerFileManagerTarget,
   applyLinuxRemoteControlConfigPreservationPatch,
   applyLinuxXdgDocumentsDirPatch,
 };
